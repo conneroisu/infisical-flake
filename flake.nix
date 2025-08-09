@@ -1,117 +1,109 @@
 {
-  description = "A development shell for go";
+  description = "Infisical - Open-source secret management platform with NixOS module";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
-    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    treefmt-nix,
-    ...
-  }:
-    flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = [
-          (final: prev: {
-            # Add your overlays here
-            # Example:
-            # my-overlay = final: prev: {
-            #   my-package = prev.callPackage ./my-package { };
-            # };
-            final.buildGoModule = prev.buildGo124Module;
-          })
-        ];
-      };
-
-      rooted = exec:
-        builtins.concatStringsSep "\n"
-        [
-          ''REPO_ROOT="$(git rev-parse --show-toplevel)"''
-          exec
-        ];
-
-      scripts = {
-        dx = {
-          exec = rooted ''$EDITOR "$REPO_ROOT"/flake.nix'';
-          description = "Edit flake.nix";
-        };
-        gx = {
-          exec = rooted ''$EDITOR "$REPO_ROOT"/go.mod'';
-          description = "Edit go.mod";
-        };
-      };
-
-      scriptPackages =
-        pkgs.lib.mapAttrs
-        (
-          name: script:
-            pkgs.writeShellApplication {
-              inherit name;
-              text = script.exec;
-              runtimeInputs = script.deps or [];
-            }
-        )
-        scripts;
-
-      treefmtModule = {
-        projectRootFile = "flake.nix";
-        programs = {
-          alejandra.enable = true; # Nix formatter
-        };
-      };
-    in {
-      devShells.default = pkgs.mkShell {
-        name = "dev";
-
-        # Available packages on https://search.nixos.org/packages
-        packages = with pkgs;
-          [
-            alejandra # Nix
-            nixd
-            statix
-            deadnix
-
-            go_1_24 # Go Tools
-            air
-            golangci-lint
-            gopls
-            revive
-            golines
-            golangci-lint-langserver
-            gomarkdoc
-            gotests
-            gotools
-            reftools
-            pprof
-            graphviz
-            goreleaser
-            cobra-cli
-          ]
-          ++ builtins.attrValues scriptPackages;
-      };
-
-      packages = {
-        default = pkgs.buildGoModule {
-          pname = "my-go-project";
-          version = "0.0.1";
-          src = self;
-          vendorHash = null;
-          meta = with pkgs.lib; {
-            description = "My Go project";
-            homepage = "https://github.com/conneroisu/my-go-project";
-            license = licenses.asl20;
-            maintainers = with maintainers; [connerohnesorge];
+  outputs = { self, nixpkgs, flake-utils, treefmt-nix, ... }:
+    let
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
+      version = "latest";
+      
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+    in
+    {
+      packages = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          
+          infisical-backend = pkgs.callPackage ./packages/backend.nix {
+            inherit version;
           };
-        };
+          
+          infisical-frontend = pkgs.callPackage ./packages/frontend.nix {
+            inherit version;
+          };
+          
+          infisical-docker = pkgs.callPackage ./packages/docker.nix {
+            inherit infisical-backend infisical-frontend;
+          };
+        in
+        {
+          default = infisical-backend;
+          backend = infisical-backend;
+          frontend = infisical-frontend;
+          docker = infisical-docker;
+        });
+
+      nixosModules = {
+        default = self.nixosModules.infisical;
+        infisical = ./modules/infisical.nix;
+        infisical-cluster = ./modules/infisical-cluster.nix;
+        infisical-backup = ./modules/infisical-backup.nix;
+        infisical-monitoring = ./modules/infisical-monitoring.nix;
       };
 
-      formatter = treefmt-nix.lib.mkWrapper pkgs treefmtModule;
-    });
+      checks = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          infisical-vm-test = pkgs.callPackage ./tests/vm-test.nix {
+            inherit self;
+            inherit (self.packages.${system}) backend frontend;
+          };
+        });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            name = "infisical-dev";
+            packages = with pkgs; [
+              nodejs_20
+              nodePackages.npm
+              nodePackages.typescript
+              nodePackages.node-gyp
+              python3
+              gnumake
+              gcc
+              postgresql_16
+              redis
+              docker-compose
+              
+              # Nix development tools
+              nixd
+              alejandra
+              statix
+              deadnix
+              nix-prefetch-git
+              nix-prefetch-github
+            ];
+            
+            shellHook = ''
+              echo "Infisical development environment"
+              echo "Run 'nix build' to build the backend package"
+              echo "Run 'nix build .#frontend' to build the frontend package"
+              echo "Run 'nix run .#checks.x86_64-linux.infisical-vm-test' to run VM tests"
+            '';
+          };
+        });
+      
+      formatter = forAllSystems (system:
+        treefmt-nix.lib.mkWrapper nixpkgs.legacyPackages.${system} {
+          projectRootFile = "flake.nix";
+          programs = {
+            alejandra.enable = true;
+            prettier.enable = true;
+          };
+        });
+    };
 }
